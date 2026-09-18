@@ -1,21 +1,22 @@
-import os
-import re
-import uuid
 import asyncio
 import ipaddress
+import os
+import re
+import shutil
 import socket
+import tempfile
+from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
 import yt_dlp
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="AllDownloader API")
+app = FastAPI(title="All Video Downloader")
 
-# Allow Netlify frontend to communicate with Render backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,252 +25,342 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DOWNLOAD_DIR = "/tmp/downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+DOWNLOAD_DIR = Path(
+    os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
+)
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class DownloadRequest(BaseModel):
-    url: HttpUrl
+    url: str = Field(min_length=8, max_length=4096)
     media: str = "video"
     quality: str = "best"
 
 
-def clean_name(name: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-    return name.strip("_")[:160] or "download"
+def valid_url(raw):
+    u = raw.strip()
+    p = urlparse(u)
 
-
-def validate_public_url(url: str):
-    parsed = urlparse(url)
-
-    if parsed.scheme not in ("http", "https"):
+    if p.scheme not in {"http", "https"} or not p.hostname:
         raise HTTPException(
-            status_code=400,
-            detail="Only HTTP/HTTPS URLs are allowed"
+            400,
+            "Enter a valid http/https URL."
         )
 
-    host = parsed.hostname
+    host = p.hostname.lower().rstrip(".")
 
-    if not host:
+    if (
+        host in {
+            "localhost",
+            "localhost.localdomain",
+            "metadata.google.internal",
+        }
+        or host.endswith(".local")
+    ):
         raise HTTPException(
-            status_code=400,
-            detail="Invalid URL"
+            400,
+            "Host not allowed."
         )
 
     try:
-        addresses = socket.getaddrinfo(host, None)
+        addresses = socket.getaddrinfo(
+            host,
+            None,
+            type=socket.SOCK_STREAM
+        )
 
-        for address in addresses:
-            ip = ipaddress.ip_address(address[4][0])
+        for item in addresses:
+            ip = ipaddress.ip_address(item[4][0])
 
             if (
                 ip.is_private
                 or ip.is_loopback
                 or ip.is_link_local
-                or ip.is_reserved
                 or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
             ):
                 raise HTTPException(
-                    status_code=400,
-                    detail="Private URLs are not allowed"
+                    400,
+                    "Private/internal address not allowed."
                 )
 
     except socket.gaierror:
         raise HTTPException(
-            status_code=400,
-            detail="Unable to resolve URL"
+            400,
+            "Host could not be resolved."
         )
+
+    return u
+
+
+def clean(n):
+    return (
+        re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "_",
+            n
+        ).strip("_")[:160]
+        or "download"
+    )
 
 
 @app.get("/")
-def root():
+async def root():
     return {
-        "status": "ok",
-        "service": "AllDownloader API"
+        "service": "All Video Downloader API",
+        "status": "ok"
     }
 
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
 
+# -----------------------------
+# QUALITY DETECTION
+# -----------------------------
+
 @app.post("/api/info")
-async def get_info(request: DownloadRequest):
+async def info(x: DownloadRequest):
 
-    url = str(request.url)
+    u = valid_url(x.url)
 
-    validate_public_url(url)
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
 
-    def extract_info():
-
-        options = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": True,
-        }
-
-        with yt_dlp.YoutubeDL(options) as ydl:
-            return ydl.extract_info(url, download=False)
+    def extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(
+                u,
+                download=False
+            )
 
     try:
+        data = await asyncio.to_thread(extract)
 
-        info = await asyncio.to_thread(extract_info)
+        found = {}
 
-        qualities = {}
-        formats = info.get("formats", [])
+        for f in data.get("formats", []):
 
-        for fmt in formats:
-
-            height = fmt.get("height")
+            height = f.get("height")
 
             if not height:
                 continue
 
-            if fmt.get("vcodec") == "none":
+            # Only formats containing video
+            if f.get("vcodec") == "none":
                 continue
 
-            qualities[height] = {
+            height = int(height)
+
+            found[height] = {
                 "height": height,
-                "ext": fmt.get("ext", "mp4"),
-                "format_id": fmt.get("format_id")
+                "label": f"{height}p"
             }
 
-        available = sorted(
-            qualities.values(),
-            key=lambda x: x["height"],
+        qualities = sorted(
+            found.values(),
+            key=lambda item: item["height"],
             reverse=True
         )
 
         return {
-            "title": info.get("title", "video"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-            "qualities": available
+            "title": data.get("title", "video"),
+            "duration": data.get("duration"),
+            "thumbnail": data.get("thumbnail"),
+            "qualities": qualities
         }
 
     except Exception as e:
 
         raise HTTPException(
-            status_code=400,
-            detail=f"Could not detect video information: {str(e)}"
+            400,
+            "Quality detection failed: " + str(e)[-700:]
         )
 
+
+# -----------------------------
+# FAST DOWNLOAD
+# -----------------------------
 
 @app.post("/api/download")
-async def download(request: DownloadRequest):
+async def download(
+    x: DownloadRequest,
+    bg: BackgroundTasks
+):
 
-    url = str(request.url)
+    u = valid_url(x.url)
 
-    validate_public_url(url)
+    media = x.media.lower().strip()
+    q = x.quality.lower().strip()
 
-    if request.media not in ("video", "audio"):
+    allowed = {
+        "best",
+        "1080",
+        "720",
+        "480",
+        "360"
+    }
+
+    if media not in {"video", "audio"}:
         raise HTTPException(
-            status_code=400,
-            detail="Invalid media type"
+            400,
+            "Invalid media type."
         )
 
-    quality = str(request.quality).lower().strip()
-
-    if request.media == "audio":
-
-        format_selector = "bestaudio/best"
-
-    elif quality == "best":
-
-        format_selector = "bestvideo+bestaudio/best"
-
-    elif quality.isdigit():
-
-        format_selector = (
-            f"bestvideo[height<={quality}]+bestaudio/"
-            f"best[height<={quality}]"
+    if q not in allowed:
+        raise HTTPException(
+            400,
+            "Invalid quality."
         )
 
-    else:
-
-        format_selector = "bestvideo+bestaudio/best"
-
-    file_id = uuid.uuid4().hex
-
-    output_template = os.path.join(
-        DOWNLOAD_DIR,
-        f"{file_id}_%(title)s.%(ext)s"
+    # Separate temporary directory
+    wd = Path(
+        tempfile.mkdtemp(
+            prefix="dl_",
+            dir=DOWNLOAD_DIR
+        )
     )
 
-    options = {
-        "outtmpl": output_template,
+    out = str(
+        wd / "%(title)s.%(ext)s"
+    )
+
+    # Faster common yt-dlp settings
+    base_opts = {
+        "outtmpl": out,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
 
-        # Faster downloading
+        # Faster downloads
         "concurrent_fragment_downloads": 8,
 
-        "retries": 5,
-        "fragment_retries": 5,
+        # Connection/retry settings
+        "retries": 3,
+        "fragment_retries": 3,
+        "file_access_retries": 3,
         "socket_timeout": 30,
 
-        "format": format_selector,
-
-        "merge_output_format": "mp4",
+        # Avoid unnecessary playlist processing
+        "extract_flat": False,
     }
 
-    if request.media == "audio":
+    if media == "audio":
 
-        options["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ]
+        opts = {
+            **base_opts,
+            "format": "bestaudio/best",
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
 
-    def perform_download():
+    else:
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            return ydl.extract_info(
-                url,
-                download=True
+        if q == "best":
+            fmt = "bestvideo*+bestaudio/best"
+
+        else:
+            limit = int(q)
+
+            fmt = (
+                f"bestvideo*[height<={limit}]"
+                f"+bestaudio/"
+                f"best[height<={limit}]"
             )
+
+        opts = {
+            **base_opts,
+            "format": fmt,
+
+            # MP4 when merging video + audio
+            "merge_output_format": "mp4",
+
+            "postprocessors": [
+                {
+                    "key": "FFmpegVideoConvertor",
+                    "preferedformat": "mp4",
+                }
+            ],
+        }
+
+    def run_download():
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([u])
 
     try:
 
-        await asyncio.to_thread(perform_download)
-
-        downloaded_files = []
-
-        for filename in os.listdir(DOWNLOAD_DIR):
-
-            if filename.startswith(file_id + "_"):
-
-                downloaded_files.append(
-                    os.path.join(
-                        DOWNLOAD_DIR,
-                        filename
-                    )
-                )
-
-        if not downloaded_files:
-
-            raise Exception(
-                "Downloaded file was not found"
-            )
-
-        filepath = downloaded_files[0]
-
-        filename = os.path.basename(filepath)
-
-        return FileResponse(
-            filepath,
-            filename=filename,
-            media_type="application/octet-stream"
+        await asyncio.to_thread(
+            run_download
         )
 
     except Exception as e:
 
-        raise HTTPException(
-            status_code=400,
-            detail=f"Download failed: {str(e)}"
+        shutil.rmtree(
+            wd,
+            ignore_errors=True
         )
+
+        raise HTTPException(
+            400,
+            "Download failed: " + str(e)[-700:]
+        )
+
+    files = [
+        p
+        for p in wd.iterdir()
+        if p.is_file()
+    ]
+
+    if not files:
+
+        shutil.rmtree(
+            wd,
+            ignore_errors=True
+        )
+
+        raise HTTPException(
+            500,
+            "No file was created."
+        )
+
+    file_path = max(
+        files,
+        key=lambda p: p.stat().st_mtime
+    )
+
+    # Keep directory alive until response is completed
+    bg.add_task(
+        shutil.rmtree,
+        wd,
+        True
+    )
+
+    extension = file_path.suffix.lower()
+
+    if extension == ".mp4":
+        mime = "video/mp4"
+    elif extension == ".mp3":
+        mime = "audio/mpeg"
+    elif extension == ".webm":
+        mime = "video/webm"
+    else:
+        mime = "application/octet-stream"
+
+    return FileResponse(
+        str(file_path),
+        filename=clean(file_path.stem) + extension,
+        media_type=mime,
+            )
