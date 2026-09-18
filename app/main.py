@@ -7,12 +7,22 @@ import socket
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import yt_dlp
 
 
 app = FastAPI(title="AllDownloader API")
+
+# Allow Netlify frontend to communicate with Render backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -33,16 +43,25 @@ def validate_public_url(url: str):
     parsed = urlparse(url)
 
     if parsed.scheme not in ("http", "https"):
-        raise HTTPException(status_code=400, detail="Only HTTP/HTTPS URLs are allowed")
+        raise HTTPException(
+            status_code=400,
+            detail="Only HTTP/HTTPS URLs are allowed"
+        )
 
     host = parsed.hostname
+
     if not host:
-        raise HTTPException(status_code=400, detail="Invalid URL")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid URL"
+        )
 
     try:
         addresses = socket.getaddrinfo(host, None)
+
         for address in addresses:
             ip = ipaddress.ip_address(address[4][0])
+
             if (
                 ip.is_private
                 or ip.is_loopback
@@ -50,9 +69,16 @@ def validate_public_url(url: str):
                 or ip.is_reserved
                 or ip.is_multicast
             ):
-                raise HTTPException(status_code=400, detail="Private URLs are not allowed")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Private URLs are not allowed"
+                )
+
     except socket.gaierror:
-        raise HTTPException(status_code=400, detail="Unable to resolve URL")
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to resolve URL"
+        )
 
 
 @app.get("/")
@@ -70,10 +96,13 @@ def health():
 
 @app.post("/api/info")
 async def get_info(request: DownloadRequest):
+
     url = str(request.url)
+
     validate_public_url(url)
 
-    def extract():
+    def extract_info():
+
         options = {
             "quiet": True,
             "no_warnings": True,
@@ -85,33 +114,43 @@ async def get_info(request: DownloadRequest):
             return ydl.extract_info(url, download=False)
 
     try:
-        info = await asyncio.to_thread(extract)
 
-        formats = []
+        info = await asyncio.to_thread(extract_info)
 
-        for f in info.get("formats", []):
-            height = f.get("height")
-            if height and f.get("vcodec") != "none":
-                formats.append({
-                    "height": height,
-                    "ext": f.get("ext"),
-                    "format_id": f.get("format_id")
-                })
+        qualities = {}
+        formats = info.get("formats", [])
 
-        unique = {}
-        for item in formats:
-            unique[item["height"]] = item
+        for fmt in formats:
 
-        qualities = sorted(unique.values(), key=lambda x: x["height"], reverse=True)
+            height = fmt.get("height")
+
+            if not height:
+                continue
+
+            if fmt.get("vcodec") == "none":
+                continue
+
+            qualities[height] = {
+                "height": height,
+                "ext": fmt.get("ext", "mp4"),
+                "format_id": fmt.get("format_id")
+            }
+
+        available = sorted(
+            qualities.values(),
+            key=lambda x: x["height"],
+            reverse=True
+        )
 
         return {
             "title": info.get("title", "video"),
             "duration": info.get("duration"),
             "thumbnail": info.get("thumbnail"),
-            "qualities": qualities
+            "qualities": available
         }
 
     except Exception as e:
+
         raise HTTPException(
             status_code=400,
             detail=f"Could not detect video information: {str(e)}"
@@ -120,34 +159,40 @@ async def get_info(request: DownloadRequest):
 
 @app.post("/api/download")
 async def download(request: DownloadRequest):
+
     url = str(request.url)
+
     validate_public_url(url)
 
     if request.media not in ("video", "audio"):
-        raise HTTPException(status_code=400, detail="Invalid media type")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid media type"
+        )
 
-    allowed_quality = {
-        "best": "bestvideo+bestaudio/best",
-        "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "720": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "480": "bestvideo[height<=480]+bestaudio/best[height<=480]",
-        "360": "bestvideo[height<=360]+bestaudio/best[height<=360]",
-    }
+    quality = str(request.quality).lower().strip()
 
-    quality = request.quality
+    if request.media == "audio":
 
-    if quality.isdigit():
+        format_selector = "bestaudio/best"
+
+    elif quality == "best":
+
+        format_selector = "bestvideo+bestaudio/best"
+
+    elif quality.isdigit():
+
         format_selector = (
             f"bestvideo[height<={quality}]+bestaudio/"
             f"best[height<={quality}]"
         )
+
     else:
-        format_selector = allowed_quality.get(
-            quality,
-            allowed_quality["best"]
-        )
+
+        format_selector = "bestvideo+bestaudio/best"
 
     file_id = uuid.uuid4().hex
+
     output_template = os.path.join(
         DOWNLOAD_DIR,
         f"{file_id}_%(title)s.%(ext)s"
@@ -158,15 +203,21 @@ async def download(request: DownloadRequest):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "concurrent_fragment_downloads": 4,
+
+        # Faster downloading
+        "concurrent_fragment_downloads": 8,
+
+        "retries": 5,
+        "fragment_retries": 5,
         "socket_timeout": 30,
+
         "format": format_selector,
+
+        "merge_output_format": "mp4",
     }
 
     if request.media == "audio":
-        options["format"] = "bestaudio/best"
+
         options["postprocessors"] = [
             {
                 "key": "FFmpegExtractAudio",
@@ -176,23 +227,38 @@ async def download(request: DownloadRequest):
         ]
 
     def perform_download():
+
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return info
+            return ydl.extract_info(
+                url,
+                download=True
+            )
 
     try:
-        info = await asyncio.to_thread(perform_download)
 
-        files = [
-            os.path.join(DOWNLOAD_DIR, f)
-            for f in os.listdir(DOWNLOAD_DIR)
-            if f.startswith(file_id + "_")
-        ]
+        await asyncio.to_thread(perform_download)
 
-        if not files:
-            raise Exception("Downloaded file was not found")
+        downloaded_files = []
 
-        filepath = files[0]
+        for filename in os.listdir(DOWNLOAD_DIR):
+
+            if filename.startswith(file_id + "_"):
+
+                downloaded_files.append(
+                    os.path.join(
+                        DOWNLOAD_DIR,
+                        filename
+                    )
+                )
+
+        if not downloaded_files:
+
+            raise Exception(
+                "Downloaded file was not found"
+            )
+
+        filepath = downloaded_files[0]
+
         filename = os.path.basename(filepath)
 
         return FileResponse(
@@ -202,7 +268,8 @@ async def download(request: DownloadRequest):
         )
 
     except Exception as e:
+
         raise HTTPException(
             status_code=400,
             detail=f"Download failed: {str(e)}"
-                                     )
+        )
