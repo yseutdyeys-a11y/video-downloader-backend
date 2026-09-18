@@ -28,7 +28,7 @@ def valid_url(raw):
     except socket.gaierror: raise HTTPException(400,"Host could not be resolved.")
     return u
 
-def clean(n): return (re.sub(r"[\\/:*?"<>|]+","_",re.sub(r"\s+"," ",n)).strip(" .") or "download")[:160]
+def clean(n): return re.sub(r'[^A-Za-z0-9._-]+', '_', n).strip('_')[:160] or 'download'
 
 @app.get("/")
 async def root(): return {"service":"All Video Downloader API","status":"ok"}
