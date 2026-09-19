@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="AllDownloader API",
-    version="2.0"
+    version="3.0"
 )
 
 app.add_middleware(
@@ -156,12 +156,12 @@ def common_options(outtmpl=None):
 
         "concurrent_fragment_downloads": 4,
 
-        # YouTube JavaScript support
+        # JavaScript runtime support
         "js_runtimes": {
             "deno": {}
         },
 
-        # EJS remote components
+        # EJS support
         "remote_components": {
             "ejs": ["github"]
         },
@@ -173,28 +173,128 @@ def common_options(outtmpl=None):
     return options
 
 
+def available_heights(formats):
+
+    result = set()
+
+    for f in formats or []:
+
+        height = f.get("height")
+
+        if not height:
+            continue
+
+        try:
+
+            height = int(height)
+
+            if (
+                height > 0
+                and f.get("vcodec")
+                not in (None, "none")
+            ):
+                result.add(height)
+
+        except (TypeError, ValueError):
+            pass
+
+    return sorted(
+        result,
+        reverse=True
+    )
+
+
+def resolve_quality(
+    quality: str,
+    heights
+):
+
+    if not heights:
+        return "best"
+
+    if not quality:
+        return "best"
+
+    if quality.lower() == "best":
+        return "best"
+
+    try:
+
+        requested = int(
+            str(quality)
+            .lower()
+            .replace("p", "")
+            .strip()
+        )
+
+    except (TypeError, ValueError):
+
+        return "best"
+
+
+    # Exact quality available
+    if requested in heights:
+
+        return str(requested)
+
+
+    # Requested quality unavailable:
+    # choose highest quality below it.
+    lower = [
+        h
+        for h in heights
+        if h <= requested
+    ]
+
+    if lower:
+
+        return str(
+            max(lower)
+        )
+
+
+    # Nothing lower exists.
+    # Use Best Available.
+    return "best"
+
+
 def choose_format(
     media: str,
-    quality: str
+    quality: str,
+    heights=None
 ) -> str:
 
     if media == "audio":
 
         return "bestaudio/best"
 
+
+    quality = resolve_quality(
+        quality,
+        heights or []
+    )
+
+
     if quality == "best":
 
-        # Video + audio separately,
-        # then FFmpeg merges them.
-        return "bestvideo+bestaudio/best"
+        return (
+            "bestvideo+bestaudio/"
+            "best"
+        )
+
 
     height = int(quality)
 
+
     return (
+        f"bestvideo[height={height}]"
+        "+"
+        "bestaudio/"
+        f"best[height={height}]"
+        "/"
         f"bestvideo[height<={height}]"
         "+"
         "bestaudio/"
-        f"best[height<={height}]"
         "/best"
     )
 
@@ -300,38 +400,78 @@ def run_download(
                 job["eta"] = ""
 
 
-    options = common_options(
-        outtmpl
-    )
+    try:
 
-    options["format"] = choose_format(
-        media,
-        quality
-    )
+        # Detect REAL available qualities first.
+        detect_options = common_options()
 
-    options["progress_hooks"] = [
-        progress_hook
-    ]
+        detect_options["skip_download"] = True
+
+        with yt_dlp.YoutubeDL(
+            detect_options
+        ) as ydl:
+
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
+
+        formats = info.get(
+            "formats"
+        ) or []
+
+        heights = available_heights(
+            formats
+        )
+
+        resolved_quality = resolve_quality(
+            quality,
+            heights
+        )
 
 
-    if media == "audio":
+        with JOBS_LOCK:
 
-        options["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
+            JOBS[job_id]["available_qualities"] = (
+                heights
+            )
+
+            JOBS[job_id]["resolved_quality"] = (
+                resolved_quality
+            )
+
+
+        options = common_options(
+            outtmpl
+        )
+
+        options["format"] = choose_format(
+            media,
+            quality,
+            heights
+        )
+
+        options["progress_hooks"] = [
+            progress_hook
         ]
 
-    else:
 
-        # IMPORTANT:
-        # Video + Audio -> MP4
-        options["merge_output_format"] = "mp4"
+        if media == "audio":
 
+            options["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ]
 
-    try:
+        else:
+
+            options["merge_output_format"] = (
+                "mp4"
+            )
+
 
         with yt_dlp.YoutubeDL(
             options
@@ -526,24 +666,27 @@ async def info(
 
         if media == "video":
 
-            heights = sorted(
-                {
-                    int(f["height"])
-                    for f in formats
-                    if f.get("height")
-                    and f.get("vcodec")
-                    not in (None, "none")
-                    and int(f["height"]) <= 2160
-                },
-                reverse=True
+            heights = available_heights(
+                formats
             )
 
 
-            for height in heights[:8]:
+            # Best Available is always first.
+            qualities.append(
+                {
+                    "value": "best",
+                    "height": None,
+                    "label": "Best available",
+                    "filesize": None,
+                }
+            )
+
+
+            for height in heights:
 
                 size = None
 
-                for f in reversed(formats):
+                for f in formats:
 
                     if f.get(
                         "height"
@@ -572,23 +715,6 @@ async def info(
                         "filesize": size,
                     }
                 )
-
-
-            if not qualities:
-
-                qualities = [
-                    {
-                        "value": "best",
-
-                        "height": None,
-
-                        "label": (
-                            "Best available"
-                        ),
-
-                        "filesize": None,
-                    }
-                ]
 
 
         else:
@@ -629,6 +755,10 @@ async def info(
                 data.get("uploader")
                 or data.get("channel")
                 or ""
+            ),
+
+            "available_qualities": (
+                available_heights(formats)
             ),
 
             "qualities": qualities,
@@ -681,18 +811,24 @@ async def start(
         )
 
 
-    if quality not in {
-        "best",
-        "1080",
-        "720",
-        "480",
-        "360"
-    }:
+    # Accept ANY numeric quality.
+    # Actual availability is checked automatically.
+    if quality != "best":
 
-        raise HTTPException(
-            400,
-            "Invalid quality."
-        )
+        try:
+
+            int(
+                quality
+                .replace("p", "")
+                .strip()
+            )
+
+        except ValueError:
+
+            raise HTTPException(
+                400,
+                "Invalid quality."
+            )
 
 
     job_id = await start_job(
@@ -738,6 +874,10 @@ async def progress(
             "filename": job["filename"],
 
             "error": job["error"],
+
+            "resolved_quality": job.get(
+                "resolved_quality"
+            ),
         }
 
 
@@ -834,11 +974,7 @@ async def get_file(
     )
 
 
-# ============================================================
-# BACKWARD COMPATIBILITY
-# Existing frontend can still use /api/download
-# ============================================================
-
+# Existing frontend compatibility
 @app.post("/api/download")
 async def download_legacy(
     request: DownloadRequest,
@@ -873,18 +1009,22 @@ async def download_legacy(
         )
 
 
-    if quality not in {
-        "best",
-        "1080",
-        "720",
-        "480",
-        "360"
-    }:
+    if quality != "best":
 
-        raise HTTPException(
-            400,
-            "Invalid quality."
-        )
+        try:
+
+            int(
+                quality
+                .replace("p", "")
+                .strip()
+            )
+
+        except ValueError:
+
+            raise HTTPException(
+                400,
+                "Invalid quality."
+            )
 
 
     workdir = Path(
@@ -900,34 +1040,54 @@ async def download_legacy(
     )
 
 
-    options = common_options(
-        outtmpl
-    )
+    try:
 
-    options["format"] = choose_format(
-        media,
-        quality
-    )
+        detect_options = common_options()
+
+        detect_options["skip_download"] = True
+
+        with yt_dlp.YoutubeDL(
+            detect_options
+        ) as ydl:
+
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
 
 
-    if media == "audio":
-
-        options["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ]
-
-    else:
-
-        options["merge_output_format"] = (
-            "mp4"
+        heights = available_heights(
+            info.get("formats") or []
         )
 
 
-    try:
+        options = common_options(
+            outtmpl
+        )
+
+        options["format"] = choose_format(
+            media,
+            quality,
+            heights
+        )
+
+
+        if media == "audio":
+
+            options["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ]
+
+        else:
+
+            options["merge_output_format"] = (
+                "mp4"
+            )
+
 
         await asyncio.to_thread(
             lambda:
@@ -1008,4 +1168,4 @@ async def download_legacy(
         str(file_path),
         filename=filename,
         media_type=media_type,
-    )
+                     )
