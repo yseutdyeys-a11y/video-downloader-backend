@@ -5,6 +5,9 @@ import re
 import shutil
 import socket
 import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,13 +18,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 
-# ============================================================
-# APP
-# ============================================================
-
 app = FastAPI(
     title="AllDownloader API",
-    version="1.0.0"
+    version="2.0"
 )
 
 app.add_middleware(
@@ -33,10 +32,6 @@ app.add_middleware(
 )
 
 
-# ============================================================
-# DOWNLOAD DIRECTORY
-# ============================================================
-
 DOWNLOAD_DIR = Path(
     os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 )
@@ -47,9 +42,9 @@ DOWNLOAD_DIR.mkdir(
 )
 
 
-# ============================================================
-# REQUEST MODEL
-# ============================================================
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
 
 class DownloadRequest(BaseModel):
     url: str = Field(
@@ -58,44 +53,32 @@ class DownloadRequest(BaseModel):
     )
 
     media: str = "video"
-
     quality: str = "best"
 
 
-# ============================================================
-# URL SECURITY
-# ============================================================
-
 def valid_url(raw: str) -> str:
 
-    url = raw.strip()
+    u = raw.strip()
+    p = urlparse(u)
 
-    parsed = urlparse(url)
-
-    if parsed.scheme not in {"http", "https"}:
+    if p.scheme not in {"http", "https"} or not p.hostname:
         raise HTTPException(
-            status_code=400,
-            detail="Enter a valid http/https URL."
+            400,
+            "Enter a valid http/https URL."
         )
 
-    if not parsed.hostname:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid URL."
-        )
+    host = p.hostname.lower().rstrip(".")
 
-    host = parsed.hostname.lower().rstrip(".")
-
-    blocked_hosts = {
+    blocked = {
         "localhost",
         "localhost.localdomain",
         "metadata.google.internal",
     }
 
-    if host in blocked_hosts or host.endswith(".local"):
+    if host in blocked or host.endswith(".local"):
         raise HTTPException(
-            status_code=400,
-            detail="Host not allowed."
+            400,
+            "Host not allowed."
         )
 
     try:
@@ -122,23 +105,19 @@ def valid_url(raw: str) -> str:
                 ip.is_unspecified,
             ]):
                 raise HTTPException(
-                    status_code=400,
-                    detail="Private/internal address not allowed."
+                    400,
+                    "Private/internal address not allowed."
                 )
 
     except socket.gaierror:
 
         raise HTTPException(
-            status_code=400,
-            detail="Host could not be resolved."
+            400,
+            "Host could not be resolved."
         )
 
-    return url
+    return u
 
-
-# ============================================================
-# SAFE FILE NAME
-# ============================================================
 
 def clean_name(name: str) -> str:
 
@@ -153,16 +132,336 @@ def clean_name(name: str) -> str:
     return name[:90] or "download"
 
 
-# ============================================================
-# BASIC ROUTES
-# ============================================================
+def common_options(outtmpl=None):
+
+    options = {
+
+        "noplaylist": True,
+
+        "quiet": True,
+
+        "no_warnings": True,
+
+        "retries": 5,
+
+        "fragment_retries": 5,
+
+        "socket_timeout": 30,
+
+        "restrictfilenames": True,
+
+        "continuedl": True,
+
+        "overwrites": False,
+
+        "concurrent_fragment_downloads": 4,
+
+        # YouTube JavaScript support
+        "js_runtimes": {
+            "deno": {}
+        },
+
+        # EJS remote components
+        "remote_components": {
+            "ejs": ["github"]
+        },
+    }
+
+    if outtmpl:
+        options["outtmpl"] = outtmpl
+
+    return options
+
+
+def choose_format(
+    media: str,
+    quality: str
+) -> str:
+
+    if media == "audio":
+
+        return "bestaudio/best"
+
+    if quality == "best":
+
+        # Video + audio separately,
+        # then FFmpeg merges them.
+        return "bestvideo+bestaudio/best"
+
+    height = int(quality)
+
+    return (
+        f"bestvideo[height<={height}]"
+        "+"
+        "bestaudio/"
+        f"best[height<={height}]"
+        "/best"
+    )
+
+
+def find_output_files(workdir: Path):
+
+    return [
+        p
+        for p in workdir.iterdir()
+        if p.is_file()
+        and not p.name.endswith(".part")
+        and not p.name.endswith(".ytdl")
+    ]
+
+
+def run_download(
+    job_id: str,
+    url: str,
+    media: str,
+    quality: str
+):
+
+    workdir = Path(
+        tempfile.mkdtemp(
+            prefix="job_",
+            dir=DOWNLOAD_DIR
+        )
+    )
+
+    outtmpl = str(
+        workdir / "%(id)s.%(ext)s"
+    )
+
+    with JOBS_LOCK:
+
+        JOBS[job_id]["workdir"] = str(
+            workdir
+        )
+
+
+    def progress_hook(data):
+
+        status = data.get("status")
+
+        with JOBS_LOCK:
+
+            job = JOBS.get(job_id)
+
+            if not job:
+                return
+
+
+            if status == "downloading":
+
+                downloaded = (
+                    data.get("downloaded_bytes")
+                    or 0
+                )
+
+                total = (
+                    data.get("total_bytes")
+                    or data.get("total_bytes_estimate")
+                    or 0
+                )
+
+                if total:
+
+                    job["percent"] = min(
+                        99.0,
+                        downloaded * 100 / total
+                    )
+
+                job["downloaded_bytes"] = downloaded
+
+                job["total_bytes"] = total
+
+                job["speed"] = (
+                    data.get("_speed_str")
+                    or "Downloading..."
+                )
+
+                job["eta"] = (
+                    data.get("_eta_str")
+                    or ""
+                )
+
+                job["status"] = "downloading"
+
+
+            elif status == "finished":
+
+                job["percent"] = max(
+                    job.get("percent", 0),
+                    99.0
+                )
+
+                job["status"] = "merging"
+
+                job["speed"] = (
+                    "FFmpeg processing..."
+                )
+
+                job["eta"] = ""
+
+
+    options = common_options(
+        outtmpl
+    )
+
+    options["format"] = choose_format(
+        media,
+        quality
+    )
+
+    options["progress_hooks"] = [
+        progress_hook
+    ]
+
+
+    if media == "audio":
+
+        options["postprocessors"] = [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ]
+
+    else:
+
+        # IMPORTANT:
+        # Video + Audio -> MP4
+        options["merge_output_format"] = "mp4"
+
+
+    try:
+
+        with yt_dlp.YoutubeDL(
+            options
+        ) as ydl:
+
+            ydl.download([url])
+
+
+        files = find_output_files(
+            workdir
+        )
+
+        if not files:
+
+            raise RuntimeError(
+                "No file was created."
+            )
+
+
+        file_path = max(
+            files,
+            key=lambda p: p.stat().st_mtime
+        )
+
+
+        with JOBS_LOCK:
+
+            JOBS[job_id]["status"] = (
+                "finished"
+            )
+
+            JOBS[job_id]["percent"] = (
+                100.0
+            )
+
+            JOBS[job_id]["file"] = (
+                str(file_path)
+            )
+
+            JOBS[job_id]["filename"] = (
+                clean_name(
+                    file_path.stem
+                )
+                +
+                file_path.suffix.lower()
+            )
+
+            JOBS[job_id]["speed"] = (
+                "Complete"
+            )
+
+            JOBS[job_id]["eta"] = ""
+
+
+    except Exception as exc:
+
+        shutil.rmtree(
+            workdir,
+            ignore_errors=True
+        )
+
+        message = str(exc).replace(
+            "\n",
+            " "
+        )
+
+        with JOBS_LOCK:
+
+            JOBS[job_id]["status"] = (
+                "error"
+            )
+
+            JOBS[job_id]["error"] = (
+                message[-1000:]
+            )
+
+
+async def start_job(
+    url: str,
+    media: str,
+    quality: str
+):
+
+    job_id = uuid.uuid4().hex
+
+    with JOBS_LOCK:
+
+        JOBS[job_id] = {
+
+            "status": "starting",
+
+            "percent": 0.0,
+
+            "downloaded_bytes": 0,
+
+            "total_bytes": 0,
+
+            "speed": "Starting...",
+
+            "eta": "",
+
+            "file": None,
+
+            "filename": None,
+
+            "error": None,
+
+            "created": time.time(),
+        }
+
+
+    asyncio.create_task(
+        asyncio.to_thread(
+            run_download,
+            job_id,
+            url,
+            media,
+            quality,
+        )
+    )
+
+    return job_id
+
 
 @app.get("/")
 async def root():
 
     return {
         "service": "AllDownloader API",
-        "status": "ok"
+        "status": "ok",
     }
 
 
@@ -174,27 +473,13 @@ async def health():
     }
 
 
-# ============================================================
-# DOWNLOAD API
-# ============================================================
-
-@app.post("/api/download")
-async def download(
-    request: DownloadRequest,
-    bg: BackgroundTasks
+@app.get("/api/info")
+async def info(
+    url: str,
+    media: str = "video"
 ):
 
-    # --------------------------------------------------------
-    # Validate URL
-    # --------------------------------------------------------
-
-    url = valid_url(request.url)
-
-    # --------------------------------------------------------
-    # Validate media
-    # --------------------------------------------------------
-
-    media = request.media.lower().strip()
+    url = valid_url(url)
 
     if media not in {
         "video",
@@ -202,34 +487,405 @@ async def download(
     }:
 
         raise HTTPException(
-            status_code=400,
-            detail="Invalid media type."
+            400,
+            "Invalid media type."
         )
 
-    # --------------------------------------------------------
-    # Validate quality
-    # --------------------------------------------------------
 
-    quality = request.quality.lower().strip()
+    options = common_options()
 
-    allowed_quality = {
+    options["skip_download"] = True
+
+
+    try:
+
+        with yt_dlp.YoutubeDL(
+            options
+        ) as ydl:
+
+            data = ydl.extract_info(
+                url,
+                download=False
+            )
+
+
+        if data.get("_type") == "playlist":
+
+            raise RuntimeError(
+                "Playlists are not supported."
+            )
+
+
+        formats = data.get(
+            "formats"
+        ) or []
+
+
+        qualities = []
+
+
+        if media == "video":
+
+            heights = sorted(
+                {
+                    int(f["height"])
+                    for f in formats
+                    if f.get("height")
+                    and f.get("vcodec")
+                    not in (None, "none")
+                    and int(f["height"]) <= 2160
+                },
+                reverse=True
+            )
+
+
+            for height in heights[:8]:
+
+                size = None
+
+                for f in reversed(formats):
+
+                    if f.get(
+                        "height"
+                    ) == height:
+
+                        size = (
+                            f.get("filesize")
+                            or
+                            f.get(
+                                "filesize_approx"
+                            )
+                        )
+
+                        if size:
+                            break
+
+
+                qualities.append(
+                    {
+                        "value": str(height),
+
+                        "height": height,
+
+                        "label": f"{height}p",
+
+                        "filesize": size,
+                    }
+                )
+
+
+            if not qualities:
+
+                qualities = [
+                    {
+                        "value": "best",
+
+                        "height": None,
+
+                        "label": (
+                            "Best available"
+                        ),
+
+                        "filesize": None,
+                    }
+                ]
+
+
+        else:
+
+            qualities = [
+                {
+                    "value": "best",
+
+                    "height": None,
+
+                    "label": (
+                        "Best audio available"
+                    ),
+
+                    "filesize": None,
+                }
+            ]
+
+
+        return {
+
+            "title": (
+                data.get("title")
+                or "Video"
+            ),
+
+            "thumbnail": (
+                data.get("thumbnail")
+                or ""
+            ),
+
+            "duration": (
+                data.get("duration")
+                or 0
+            ),
+
+            "uploader": (
+                data.get("uploader")
+                or data.get("channel")
+                or ""
+            ),
+
+            "qualities": qualities,
+        }
+
+
+    except Exception as exc:
+
+        raise HTTPException(
+            400,
+            "Could not detect this URL: "
+            +
+            str(exc).replace(
+                "\n",
+                " "
+            )[:500],
+        )
+
+
+@app.post("/api/start")
+async def start(
+    request: DownloadRequest
+):
+
+    url = valid_url(
+        request.url
+    )
+
+    media = (
+        request.media
+        .lower()
+        .strip()
+    )
+
+    quality = (
+        request.quality
+        .lower()
+        .strip()
+    )
+
+
+    if media not in {
+        "video",
+        "audio"
+    }:
+
+        raise HTTPException(
+            400,
+            "Invalid media type."
+        )
+
+
+    if quality not in {
         "best",
         "1080",
         "720",
         "480",
-        "360",
-    }
-
-    if quality not in allowed_quality:
+        "360"
+    }:
 
         raise HTTPException(
-            status_code=400,
-            detail="Invalid quality."
+            400,
+            "Invalid quality."
         )
 
-    # --------------------------------------------------------
-    # Temporary working directory
-    # --------------------------------------------------------
+
+    job_id = await start_job(
+        url,
+        media,
+        quality
+    )
+
+    return {
+        "job_id": job_id
+    }
+
+
+@app.get("/api/progress/{job_id}")
+async def progress(
+    job_id: str
+):
+
+    with JOBS_LOCK:
+
+        job = JOBS.get(
+            job_id
+        )
+
+        if not job:
+
+            raise HTTPException(
+                404,
+                "Download job not found."
+            )
+
+
+        return {
+
+            "status": job["status"],
+
+            "percent": job["percent"],
+
+            "speed": job["speed"],
+
+            "eta": job["eta"],
+
+            "filename": job["filename"],
+
+            "error": job["error"],
+        }
+
+
+@app.get("/api/file/{job_id}")
+async def get_file(
+    job_id: str,
+    bg: BackgroundTasks
+):
+
+    with JOBS_LOCK:
+
+        job = JOBS.get(
+            job_id
+        )
+
+        if not job:
+
+            raise HTTPException(
+                404,
+                "Download job not found."
+            )
+
+
+        if (
+            job["status"] != "finished"
+            or not job["file"]
+        ):
+
+            raise HTTPException(
+                409,
+                "Download is not finished yet."
+            )
+
+
+        file_path = Path(
+            job["file"]
+        )
+
+        filename = (
+            job["filename"]
+            or file_path.name
+        )
+
+
+    if not file_path.exists():
+
+        raise HTTPException(
+            404,
+            "Downloaded file is no longer available."
+        )
+
+
+    if (
+        file_path.suffix.lower()
+        == ".mp3"
+    ):
+
+        media_type = "audio/mpeg"
+
+    else:
+
+        media_type = "video/mp4"
+
+
+    def cleanup():
+
+        with JOBS_LOCK:
+
+            current = JOBS.pop(
+                job_id,
+                None
+            )
+
+        if current:
+
+            shutil.rmtree(
+                current.get(
+                    "workdir",
+                    ""
+                ),
+                ignore_errors=True
+            )
+
+
+    bg.add_task(
+        cleanup
+    )
+
+
+    return FileResponse(
+        str(file_path),
+        filename=filename,
+        media_type=media_type,
+    )
+
+
+# ============================================================
+# BACKWARD COMPATIBILITY
+# Existing frontend can still use /api/download
+# ============================================================
+
+@app.post("/api/download")
+async def download_legacy(
+    request: DownloadRequest,
+    bg: BackgroundTasks
+):
+
+    url = valid_url(
+        request.url
+    )
+
+    media = (
+        request.media
+        .lower()
+        .strip()
+    )
+
+    quality = (
+        request.quality
+        .lower()
+        .strip()
+    )
+
+
+    if media not in {
+        "video",
+        "audio"
+    }:
+
+        raise HTTPException(
+            400,
+            "Invalid media type."
+        )
+
+
+    if quality not in {
+        "best",
+        "1080",
+        "720",
+        "480",
+        "360"
+    }:
+
+        raise HTTPException(
+            400,
+            "Invalid quality."
+        )
+
 
     workdir = Path(
         tempfile.mkdtemp(
@@ -238,195 +894,70 @@ async def download(
         )
     )
 
-    # IMPORTANT:
-    # ID based filename prevents very long filename errors.
 
     outtmpl = str(
         workdir / "%(id)s.%(ext)s"
     )
 
-    # ========================================================
-    # COMMON YT-DLP OPTIONS
-    # ========================================================
 
-    common = {
+    options = common_options(
+        outtmpl
+    )
 
-        # Output
-        "outtmpl": outtmpl,
+    options["format"] = choose_format(
+        media,
+        quality
+    )
 
-        # Never download playlist
-        "noplaylist": True,
-
-        # Cleaner server logs
-        "quiet": True,
-        "no_warnings": True,
-
-        # Retry
-        "retries": 5,
-        "fragment_retries": 5,
-
-        # Network timeout
-        "socket_timeout": 30,
-
-        # Safe filenames
-        "restrictfilenames": True,
-
-        # Faster fragmented downloads
-        "concurrent_fragment_downloads": 4,
-
-        # ----------------------------------------------------
-        # YouTube JavaScript challenge support
-        # ----------------------------------------------------
-
-        "js_runtimes": {
-            "deno": {}
-        },
-
-        # EJS remote components
-        "remote_components": {
-            "ejs": ["github"]
-        },
-
-        # Continue interrupted downloads
-        "continuedl": True,
-
-        # Don't overwrite unnecessarily
-        "overwrites": False,
-    }
-
-
-    # ========================================================
-    # AUDIO DOWNLOAD
-    # ========================================================
 
     if media == "audio":
 
-        opts = {
-            **common,
-
-            # Best available audio
-            "format": "bestaudio/best",
-
-            # Convert to MP3
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        }
-
-
-    # ========================================================
-    # VIDEO DOWNLOAD
-    # ========================================================
+        options["postprocessors"] = [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ]
 
     else:
 
-        # ----------------------------------------------------
-        # BEST QUALITY
-        # ----------------------------------------------------
+        options["merge_output_format"] = (
+            "mp4"
+        )
 
-        if quality == "best":
-
-            # VERY IMPORTANT:
-            #
-            # bestvideo + bestaudio
-            #
-            # This downloads separate video and audio streams
-            # when the website provides them.
-            #
-            # FFmpeg then merges them into one MP4.
-            #
-
-            fmt = (
-                "bestvideo+bestaudio/"
-                "best"
-            )
-
-        # ----------------------------------------------------
-        # SPECIFIC QUALITY
-        # ----------------------------------------------------
-
-        else:
-
-            height = int(quality)
-
-            fmt = (
-                f"bestvideo[height<={height}]"
-                "+"
-                "bestaudio/"
-                f"best[height<={height}]"
-                "/best"
-            )
-
-        opts = {
-            **common,
-
-            # Video + Audio
-            "format": fmt,
-
-            # ------------------------------------------------
-            # THIS IS THE IMPORTANT PART
-            # ------------------------------------------------
-            #
-            # FFmpeg combines:
-            #
-            # video stream
-            # +
-            # audio stream
-            #
-            # into one MP4 file.
-            #
-
-            "merge_output_format": "mp4",
-        }
-
-
-    # ========================================================
-    # ACTUAL DOWNLOAD
-    # ========================================================
 
     try:
 
         await asyncio.to_thread(
-            lambda: yt_dlp.YoutubeDL(opts).download([url])
+            lambda:
+            yt_dlp.YoutubeDL(
+                options
+            ).download([url])
         )
+
 
     except Exception as exc:
 
-        # Remove temporary files
         shutil.rmtree(
             workdir,
             ignore_errors=True
         )
 
-        message = str(exc).replace(
-            "\n",
-            " "
-        )
-
         raise HTTPException(
-            status_code=400,
-            detail=(
-                "Download failed: "
-                + message[-1000:]
-            )
+            400,
+            "Download failed: "
+            +
+            str(exc).replace(
+                "\n",
+                " "
+            )[-1000:]
         )
 
 
-    # ========================================================
-    # FIND GENERATED FILE
-    # ========================================================
-
-    files = [
-        file
-        for file in workdir.iterdir()
-        if file.is_file()
-        and not file.name.endswith(".part")
-        and not file.name.endswith(".ytdl")
-    ]
+    files = find_output_files(
+        workdir
+    )
 
 
     if not files:
@@ -437,45 +968,25 @@ async def download(
         )
 
         raise HTTPException(
-            status_code=500,
-            detail="No file was created."
+            500,
+            "No file was created."
         )
 
 
-    # Newest generated file
     file_path = max(
         files,
-        key=lambda file: file.stat().st_mtime
+        key=lambda p: p.stat().st_mtime
     )
 
-
-    # ========================================================
-    # FILE EXTENSION
-    # ========================================================
-
-    ext = file_path.suffix.lower()
-
-    if not ext:
-
-        if media == "audio":
-            ext = ".mp3"
-        else:
-            ext = ".mp4"
-
-
-    # ========================================================
-    # DOWNLOAD FILE NAME
-    # ========================================================
 
     filename = (
-        clean_name(file_path.stem)
-        + ext
+        clean_name(
+            file_path.stem
+        )
+        +
+        file_path.suffix.lower()
     )
 
-
-    # ========================================================
-    # MIME TYPE
-    # ========================================================
 
     if media == "audio":
 
@@ -486,10 +997,6 @@ async def download(
         media_type = "video/mp4"
 
 
-    # ========================================================
-    # CLEANUP AFTER RESPONSE
-    # ========================================================
-
     bg.add_task(
         shutil.rmtree,
         workdir,
@@ -497,12 +1004,8 @@ async def download(
     )
 
 
-    # ========================================================
-    # RETURN FILE
-    # ========================================================
-
     return FileResponse(
-        path=str(file_path),
+        str(file_path),
         filename=filename,
         media_type=media_type,
     )
