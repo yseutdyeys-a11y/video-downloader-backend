@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="AllDownloader API",
-    version="3.0"
+    version="4.0"
 )
 
 app.add_middleware(
@@ -31,7 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 DOWNLOAD_DIR = Path(
     os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 )
@@ -40,7 +39,6 @@ DOWNLOAD_DIR.mkdir(
     parents=True,
     exist_ok=True
 )
-
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -51,7 +49,6 @@ class DownloadRequest(BaseModel):
         min_length=8,
         max_length=4096
     )
-
     media: str = "video"
     quality: str = "best"
 
@@ -156,12 +153,10 @@ def common_options(outtmpl=None):
 
         "concurrent_fragment_downloads": 4,
 
-        # JavaScript runtime support
         "js_runtimes": {
             "deno": {}
         },
 
-        # EJS support
         "remote_components": {
             "ejs": ["github"]
         },
@@ -171,6 +166,47 @@ def common_options(outtmpl=None):
         options["outtmpl"] = outtmpl
 
     return options
+
+
+def normalize_quality(quality):
+
+    if quality is None:
+        return "best"
+
+    quality = str(quality).lower().strip()
+
+    if quality in {
+        "",
+        "best",
+        "best available",
+        "best_available"
+    }:
+        return "best"
+
+    quality = quality.replace(
+        "best available",
+        "best"
+    )
+
+    if quality == "best":
+        return "best"
+
+    quality = quality.replace(
+        "p",
+        ""
+    ).strip()
+
+    try:
+        height = int(quality)
+
+        if height <= 0:
+            return "best"
+
+        return str(height)
+
+    except (TypeError, ValueError):
+
+        return "best"
 
 
 def available_heights(formats):
@@ -205,41 +241,27 @@ def available_heights(formats):
 
 
 def resolve_quality(
-    quality: str,
+    quality,
     heights
 ):
 
-    if not heights:
+    heights = sorted(
+        set(heights or []),
+        reverse=True
+    )
+
+    quality = normalize_quality(
+        quality
+    )
+
+    if quality == "best":
         return "best"
 
-    if not quality:
-        return "best"
+    requested = int(quality)
 
-    if quality.lower() == "best":
-        return "best"
-
-    try:
-
-        requested = int(
-            str(quality)
-            .lower()
-            .replace("p", "")
-            .strip()
-        )
-
-    except (TypeError, ValueError):
-
-        return "best"
-
-
-    # Exact quality available
     if requested in heights:
-
         return str(requested)
 
-
-    # Requested quality unavailable:
-    # choose highest quality below it.
     lower = [
         h
         for h in heights
@@ -247,63 +269,50 @@ def resolve_quality(
     ]
 
     if lower:
-
         return str(
             max(lower)
         )
 
-
-    # Nothing lower exists.
-    # Use Best Available.
     return "best"
 
 
 def choose_format(
-    media: str,
-    quality: str,
+    media,
+    quality,
     heights=None
-) -> str:
+):
 
     if media == "audio":
-
         return "bestaudio/best"
 
-
-    quality = resolve_quality(
+    resolved = resolve_quality(
         quality,
         heights or []
     )
 
-
-    if quality == "best":
+    if resolved == "best":
 
         return (
             "bestvideo+bestaudio/"
             "best"
         )
 
-
-    height = int(quality)
-
+    height = int(resolved)
 
     return (
-        f"bestvideo[height={height}]"
-        "+"
-        "bestaudio/"
-        f"best[height={height}]"
-        "/"
-        f"bestvideo[height<={height}]"
-        "+"
-        "bestaudio/"
-        "/best"
+        f"bestvideo[height={height}]+bestaudio/"
+        f"best[height={height}]/"
+        f"bestvideo[height<={height}]+bestaudio/"
+        f"best[height<={height}]/"
+        "best"
     )
 
 
-def find_output_files(workdir: Path):
+def find_output_files(workdir):
 
     return [
         p
-        for p in workdir.iterdir()
+        for p in Path(workdir).iterdir()
         if p.is_file()
         and not p.name.endswith(".part")
         and not p.name.endswith(".ytdl")
@@ -311,10 +320,10 @@ def find_output_files(workdir: Path):
 
 
 def run_download(
-    job_id: str,
-    url: str,
-    media: str,
-    quality: str
+    job_id,
+    url,
+    media,
+    quality
 ):
 
     workdir = Path(
@@ -334,7 +343,6 @@ def run_download(
             workdir
         )
 
-
     def progress_hook(data):
 
         status = data.get("status")
@@ -345,7 +353,6 @@ def run_download(
 
             if not job:
                 return
-
 
             if status == "downloading":
 
@@ -383,7 +390,6 @@ def run_download(
 
                 job["status"] = "downloading"
 
-
             elif status == "finished":
 
                 job["percent"] = max(
@@ -399,10 +405,8 @@ def run_download(
 
                 job["eta"] = ""
 
-
     try:
 
-        # Detect REAL available qualities first.
         detect_options = common_options()
 
         detect_options["skip_download"] = True
@@ -416,6 +420,12 @@ def run_download(
                 download=False
             )
 
+        if info.get("_type") == "playlist":
+
+            raise RuntimeError(
+                "Playlists are not supported."
+            )
+
         formats = info.get(
             "formats"
         ) or []
@@ -424,22 +434,28 @@ def run_download(
             formats
         )
 
+        requested_quality = normalize_quality(
+            quality
+        )
+
         resolved_quality = resolve_quality(
-            quality,
+            requested_quality,
             heights
         )
 
-
         with JOBS_LOCK:
 
-            JOBS[job_id]["available_qualities"] = (
-                heights
-            )
+            JOBS[job_id][
+                "available_qualities"
+            ] = heights
 
-            JOBS[job_id]["resolved_quality"] = (
-                resolved_quality
-            )
+            JOBS[job_id][
+                "requested_quality"
+            ] = requested_quality
 
+            JOBS[job_id][
+                "resolved_quality"
+            ] = resolved_quality
 
         options = common_options(
             outtmpl
@@ -447,14 +463,13 @@ def run_download(
 
         options["format"] = choose_format(
             media,
-            quality,
+            requested_quality,
             heights
         )
 
         options["progress_hooks"] = [
             progress_hook
         ]
-
 
         if media == "audio":
 
@@ -472,13 +487,11 @@ def run_download(
                 "mp4"
             )
 
-
         with yt_dlp.YoutubeDL(
             options
         ) as ydl:
 
             ydl.download([url])
-
 
         files = find_output_files(
             workdir
@@ -490,12 +503,10 @@ def run_download(
                 "No file was created."
             )
 
-
         file_path = max(
             files,
             key=lambda p: p.stat().st_mtime
         )
-
 
         with JOBS_LOCK:
 
@@ -525,7 +536,6 @@ def run_download(
 
             JOBS[job_id]["eta"] = ""
 
-
     except Exception as exc:
 
         shutil.rmtree(
@@ -540,19 +550,21 @@ def run_download(
 
         with JOBS_LOCK:
 
-            JOBS[job_id]["status"] = (
-                "error"
-            )
+            if job_id in JOBS:
 
-            JOBS[job_id]["error"] = (
-                message[-1000:]
-            )
+                JOBS[job_id]["status"] = (
+                    "error"
+                )
+
+                JOBS[job_id]["error"] = (
+                    message[-1000:]
+                )
 
 
 async def start_job(
-    url: str,
-    media: str,
-    quality: str
+    url,
+    media,
+    quality
 ):
 
     job_id = uuid.uuid4().hex
@@ -580,8 +592,8 @@ async def start_job(
             "error": None,
 
             "created": time.time(),
-        }
 
+        }
 
     asyncio.create_task(
         asyncio.to_thread(
@@ -589,7 +601,7 @@ async def start_job(
             job_id,
             url,
             media,
-            quality,
+            quality
         )
     )
 
@@ -602,6 +614,7 @@ async def root():
     return {
         "service": "AllDownloader API",
         "status": "ok",
+        "version": "4.0"
     }
 
 
@@ -621,6 +634,12 @@ async def info(
 
     url = valid_url(url)
 
+    media = (
+        media
+        .lower()
+        .strip()
+    )
+
     if media not in {
         "video",
         "audio"
@@ -631,11 +650,9 @@ async def info(
             "Invalid media type."
         )
 
-
     options = common_options()
 
     options["skip_download"] = True
-
 
     try:
 
@@ -648,39 +665,32 @@ async def info(
                 download=False
             )
 
-
         if data.get("_type") == "playlist":
 
             raise RuntimeError(
                 "Playlists are not supported."
             )
 
-
         formats = data.get(
             "formats"
         ) or []
 
+        heights = available_heights(
+            formats
+        )
 
         qualities = []
 
-
         if media == "video":
 
-            heights = available_heights(
-                formats
-            )
-
-
-            # Best Available is always first.
             qualities.append(
                 {
                     "value": "best",
                     "height": None,
                     "label": "Best available",
-                    "filesize": None,
+                    "filesize": None
                 }
             )
-
 
             for height in heights:
 
@@ -688,51 +698,37 @@ async def info(
 
                 for f in formats:
 
-                    if f.get(
-                        "height"
-                    ) == height:
+                    if f.get("height") != height:
+                        continue
 
-                        size = (
-                            f.get("filesize")
-                            or
-                            f.get(
-                                "filesize_approx"
-                            )
-                        )
+                    size = (
+                        f.get("filesize")
+                        or
+                        f.get("filesize_approx")
+                    )
 
-                        if size:
-                            break
-
+                    if size:
+                        break
 
                 qualities.append(
                     {
                         "value": str(height),
-
                         "height": height,
-
                         "label": f"{height}p",
-
-                        "filesize": size,
+                        "filesize": size
                     }
                 )
-
 
         else:
 
             qualities = [
                 {
                     "value": "best",
-
                     "height": None,
-
-                    "label": (
-                        "Best audio available"
-                    ),
-
-                    "filesize": None,
+                    "label": "Best audio available",
+                    "filesize": None
                 }
             ]
-
 
         return {
 
@@ -757,13 +753,10 @@ async def info(
                 or ""
             ),
 
-            "available_qualities": (
-                available_heights(formats)
-            ),
+            "available_qualities": heights,
 
-            "qualities": qualities,
+            "qualities": qualities
         }
-
 
     except Exception as exc:
 
@@ -774,7 +767,7 @@ async def info(
             str(exc).replace(
                 "\n",
                 " "
-            )[:500],
+            )[:500]
         )
 
 
@@ -793,12 +786,9 @@ async def start(
         .strip()
     )
 
-    quality = (
+    quality = normalize_quality(
         request.quality
-        .lower()
-        .strip()
     )
-
 
     if media not in {
         "video",
@@ -809,27 +799,6 @@ async def start(
             400,
             "Invalid media type."
         )
-
-
-    # Accept ANY numeric quality.
-    # Actual availability is checked automatically.
-    if quality != "best":
-
-        try:
-
-            int(
-                quality
-                .replace("p", "")
-                .strip()
-            )
-
-        except ValueError:
-
-            raise HTTPException(
-                400,
-                "Invalid quality."
-            )
-
 
     job_id = await start_job(
         url,
@@ -860,7 +829,6 @@ async def progress(
                 "Download job not found."
             )
 
-
         return {
 
             "status": job["status"],
@@ -878,6 +846,11 @@ async def progress(
             "resolved_quality": job.get(
                 "resolved_quality"
             ),
+
+            "available_qualities": job.get(
+                "available_qualities",
+                []
+            )
         }
 
 
@@ -900,7 +873,6 @@ async def get_file(
                 "Download job not found."
             )
 
-
         if (
             job["status"] != "finished"
             or not job["file"]
@@ -911,7 +883,6 @@ async def get_file(
                 "Download is not finished yet."
             )
 
-
         file_path = Path(
             job["file"]
         )
@@ -921,7 +892,6 @@ async def get_file(
             or file_path.name
         )
 
-
     if not file_path.exists():
 
         raise HTTPException(
@@ -929,18 +899,13 @@ async def get_file(
             "Downloaded file is no longer available."
         )
 
-
-    if (
-        file_path.suffix.lower()
-        == ".mp3"
-    ):
+    if file_path.suffix.lower() == ".mp3":
 
         media_type = "audio/mpeg"
 
     else:
 
         media_type = "video/mp4"
-
 
     def cleanup():
 
@@ -961,20 +926,17 @@ async def get_file(
                 ignore_errors=True
             )
 
-
     bg.add_task(
         cleanup
     )
 
-
     return FileResponse(
         str(file_path),
         filename=filename,
-        media_type=media_type,
+        media_type=media_type
     )
 
 
-# Existing frontend compatibility
 @app.post("/api/download")
 async def download_legacy(
     request: DownloadRequest,
@@ -991,12 +953,9 @@ async def download_legacy(
         .strip()
     )
 
-    quality = (
+    quality = normalize_quality(
         request.quality
-        .lower()
-        .strip()
     )
-
 
     if media not in {
         "video",
@@ -1008,25 +967,6 @@ async def download_legacy(
             "Invalid media type."
         )
 
-
-    if quality != "best":
-
-        try:
-
-            int(
-                quality
-                .replace("p", "")
-                .strip()
-            )
-
-        except ValueError:
-
-            raise HTTPException(
-                400,
-                "Invalid quality."
-            )
-
-
     workdir = Path(
         tempfile.mkdtemp(
             prefix="dl_",
@@ -1034,11 +974,9 @@ async def download_legacy(
         )
     )
 
-
     outtmpl = str(
         workdir / "%(id)s.%(ext)s"
     )
-
 
     try:
 
@@ -1055,11 +993,9 @@ async def download_legacy(
                 download=False
             )
 
-
         heights = available_heights(
             info.get("formats") or []
         )
-
 
         options = common_options(
             outtmpl
@@ -1071,14 +1007,13 @@ async def download_legacy(
             heights
         )
 
-
         if media == "audio":
 
             options["postprocessors"] = [
                 {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
-                    "preferredquality": "192",
+                    "preferredquality": "192"
                 }
             ]
 
@@ -1088,14 +1023,12 @@ async def download_legacy(
                 "mp4"
             )
 
-
         await asyncio.to_thread(
             lambda:
             yt_dlp.YoutubeDL(
                 options
             ).download([url])
         )
-
 
     except Exception as exc:
 
@@ -1114,11 +1047,9 @@ async def download_legacy(
             )[-1000:]
         )
 
-
     files = find_output_files(
         workdir
     )
-
 
     if not files:
 
@@ -1132,12 +1063,10 @@ async def download_legacy(
             "No file was created."
         )
 
-
     file_path = max(
         files,
         key=lambda p: p.stat().st_mtime
     )
-
 
     filename = (
         clean_name(
@@ -1147,7 +1076,6 @@ async def download_legacy(
         file_path.suffix.lower()
     )
 
-
     if media == "audio":
 
         media_type = "audio/mpeg"
@@ -1156,16 +1084,14 @@ async def download_legacy(
 
         media_type = "video/mp4"
 
-
     bg.add_task(
         shutil.rmtree,
         workdir,
         True
     )
 
-
     return FileResponse(
         str(file_path),
         filename=filename,
-        media_type=media_type,
-                     )
+        media_type=media_type
+)
