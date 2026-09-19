@@ -4,8 +4,18 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
+    apt-get install -y --no-install-recommends \
+    ffmpeg \
+    ca-certificates \
+    curl \
+    unzip && \
     rm -rf /var/lib/apt/lists/*
+
+# Install Deno JavaScript runtime for yt-dlp YouTube extraction
+RUN curl -fsSL https://deno.land/install.sh | sh
+
+ENV DENO_INSTALL=/root/.deno
+ENV PATH="/root/.deno/bin:${PATH}"
 
 WORKDIR /app
 
