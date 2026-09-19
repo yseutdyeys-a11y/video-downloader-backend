@@ -14,7 +14,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="All Video Downloader API")
+
+# ============================================================
+# APP
+# ============================================================
+
+app = FastAPI(
+    title="AllDownloader API",
+    version="1.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,50 +32,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ============================================================
+# DOWNLOAD DIRECTORY
+# ============================================================
+
 DOWNLOAD_DIR = Path(
     os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 )
+
 DOWNLOAD_DIR.mkdir(
     parents=True,
     exist_ok=True
 )
 
 
+# ============================================================
+# REQUEST MODEL
+# ============================================================
+
 class DownloadRequest(BaseModel):
     url: str = Field(
         min_length=8,
         max_length=4096
     )
+
     media: str = "video"
+
     quality: str = "best"
 
 
-def valid_url(raw: str) -> str:
-    u = raw.strip()
-    p = urlparse(u)
+# ============================================================
+# URL SECURITY
+# ============================================================
 
-    if p.scheme not in {"http", "https"} or not p.hostname:
+def valid_url(raw: str) -> str:
+
+    url = raw.strip()
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"}:
         raise HTTPException(
-            400,
-            "Enter a valid http/https URL."
+            status_code=400,
+            detail="Enter a valid http/https URL."
         )
 
-    host = p.hostname.lower().rstrip(".")
-
-    if (
-        host in {
-            "localhost",
-            "localhost.localdomain",
-            "metadata.google.internal",
-        }
-        or host.endswith(".local")
-    ):
+    if not parsed.hostname:
         raise HTTPException(
-            400,
-            "Host not allowed."
+            status_code=400,
+            detail="Invalid URL."
+        )
+
+    host = parsed.hostname.lower().rstrip(".")
+
+    blocked_hosts = {
+        "localhost",
+        "localhost.localdomain",
+        "metadata.google.internal",
+    }
+
+    if host in blocked_hosts or host.endswith(".local"):
+        raise HTTPException(
+            status_code=400,
+            detail="Host not allowed."
         )
 
     try:
+
         addresses = {
             item[4][0]
             for item in socket.getaddrinfo(
@@ -77,85 +109,127 @@ def valid_url(raw: str) -> str:
             )
         }
 
-        for addr in addresses:
-            ip = ipaddress.ip_address(addr)
+        for address in addresses:
 
-            if any(
-                (
-                    ip.is_private,
-                    ip.is_loopback,
-                    ip.is_link_local,
-                    ip.is_multicast,
-                    ip.is_reserved,
-                    ip.is_unspecified,
-                )
-            ):
+            ip = ipaddress.ip_address(address)
+
+            if any([
+                ip.is_private,
+                ip.is_loopback,
+                ip.is_link_local,
+                ip.is_multicast,
+                ip.is_reserved,
+                ip.is_unspecified,
+            ]):
                 raise HTTPException(
-                    400,
-                    "Private/internal address not allowed."
+                    status_code=400,
+                    detail="Private/internal address not allowed."
                 )
 
     except socket.gaierror:
+
         raise HTTPException(
-            400,
-            "Host could not be resolved."
+            status_code=400,
+            detail="Host could not be resolved."
         )
 
-    return u
+    return url
 
+
+# ============================================================
+# SAFE FILE NAME
+# ============================================================
 
 def clean_name(name: str) -> str:
+
     name = re.sub(
         r"[^A-Za-z0-9._-]+",
         "_",
         name
-    ).strip("_.-")
+    )
+
+    name = name.strip("_.-")
 
     return name[:90] or "download"
 
 
+# ============================================================
+# BASIC ROUTES
+# ============================================================
+
 @app.get("/")
 async def root():
+
     return {
-        "service": "All Video Downloader API",
-        "status": "ok",
+        "service": "AllDownloader API",
+        "status": "ok"
     }
 
 
 @app.get("/health")
 async def health():
+
     return {
         "status": "ok"
     }
 
 
+# ============================================================
+# DOWNLOAD API
+# ============================================================
+
 @app.post("/api/download")
 async def download(
-    x: DownloadRequest,
+    request: DownloadRequest,
     bg: BackgroundTasks
 ):
-    url = valid_url(x.url)
 
-    media = x.media.lower().strip()
-    quality = x.quality.lower().strip()
+    # --------------------------------------------------------
+    # Validate URL
+    # --------------------------------------------------------
 
-    if media not in {"video", "audio"}:
+    url = valid_url(request.url)
+
+    # --------------------------------------------------------
+    # Validate media
+    # --------------------------------------------------------
+
+    media = request.media.lower().strip()
+
+    if media not in {
+        "video",
+        "audio"
+    }:
+
         raise HTTPException(
-            400,
-            "Invalid media type."
+            status_code=400,
+            detail="Invalid media type."
         )
 
-    if quality not in {
+    # --------------------------------------------------------
+    # Validate quality
+    # --------------------------------------------------------
+
+    quality = request.quality.lower().strip()
+
+    allowed_quality = {
         "best",
         "1080",
         "720",
         "480",
         "360",
-    }:
+    }
+
+    if quality not in allowed_quality:
+
         raise HTTPException(
-            400,
-            "Invalid quality."
+            status_code=400,
+            detail="Invalid quality."
         )
+
+    # --------------------------------------------------------
+    # Temporary working directory
+    # --------------------------------------------------------
 
     workdir = Path(
         tempfile.mkdtemp(
@@ -164,47 +238,76 @@ async def download(
         )
     )
 
+    # IMPORTANT:
+    # ID based filename prevents very long filename errors.
+
     outtmpl = str(
         workdir / "%(id)s.%(ext)s"
     )
 
+    # ========================================================
+    # COMMON YT-DLP OPTIONS
+    # ========================================================
+
     common = {
+
+        # Output
         "outtmpl": outtmpl,
+
+        # Never download playlist
         "noplaylist": True,
+
+        # Cleaner server logs
         "quiet": True,
         "no_warnings": True,
 
-        # Better retry handling
+        # Retry
         "retries": 5,
         "fragment_retries": 5,
-        "file_access_retries": 5,
-        "socket_timeout": 45,
 
-        # Faster downloads
-        "concurrent_fragment_downloads": 8,
-
-        # Continue partial downloads
-        "continuedl": True,
+        # Network timeout
+        "socket_timeout": 30,
 
         # Safe filenames
         "restrictfilenames": True,
 
-        # Current YouTube extraction support
+        # Faster fragmented downloads
+        "concurrent_fragment_downloads": 4,
+
+        # ----------------------------------------------------
+        # YouTube JavaScript challenge support
+        # ----------------------------------------------------
+
         "js_runtimes": {
             "deno": {}
         },
+
+        # EJS remote components
+        "remote_components": {
+            "ejs": ["github"]
+        },
+
+        # Continue interrupted downloads
+        "continuedl": True,
+
+        # Don't overwrite unnecessarily
+        "overwrites": False,
     }
+
+
+    # ========================================================
+    # AUDIO DOWNLOAD
+    # ========================================================
 
     if media == "audio":
 
         opts = {
             **common,
 
-            "format": (
-                "bestaudio[ext=m4a]/"
-                "bestaudio/best"
-            ),
+            # Best available audio
+            "format": "bestaudio/best",
 
+            # Convert to MP3
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
@@ -214,49 +317,86 @@ async def download(
             ],
         }
 
+
+    # ========================================================
+    # VIDEO DOWNLOAD
+    # ========================================================
+
     else:
+
+        # ----------------------------------------------------
+        # BEST QUALITY
+        # ----------------------------------------------------
 
         if quality == "best":
 
+            # VERY IMPORTANT:
+            #
+            # bestvideo + bestaudio
+            #
+            # This downloads separate video and audio streams
+            # when the website provides them.
+            #
+            # FFmpeg then merges them into one MP4.
+            #
+
             fmt = (
-                "bestvideo[ext=mp4]+"
-                "bestaudio[ext=m4a]/"
                 "bestvideo+bestaudio/"
-                "best[ext=mp4]/"
                 "best"
             )
 
+        # ----------------------------------------------------
+        # SPECIFIC QUALITY
+        # ----------------------------------------------------
+
         else:
 
-            n = int(quality)
+            height = int(quality)
 
             fmt = (
-                f"bestvideo[height<={n}][ext=mp4]+"
-                f"bestaudio[ext=m4a]/"
-                f"bestvideo[height<={n}]+"
-                f"bestaudio/"
-                f"best[height<={n}][ext=mp4]/"
-                f"best[height<={n}]"
+                f"bestvideo[height<={height}]"
+                "+"
+                "bestaudio/"
+                f"best[height<={height}]"
+                "/best"
             )
 
         opts = {
             **common,
+
+            # Video + Audio
             "format": fmt,
+
+            # ------------------------------------------------
+            # THIS IS THE IMPORTANT PART
+            # ------------------------------------------------
+            #
+            # FFmpeg combines:
+            #
+            # video stream
+            # +
+            # audio stream
+            #
+            # into one MP4 file.
+            #
+
             "merge_output_format": "mp4",
         }
 
-    def run_download():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+
+    # ========================================================
+    # ACTUAL DOWNLOAD
+    # ========================================================
 
     try:
 
         await asyncio.to_thread(
-            run_download
+            lambda: yt_dlp.YoutubeDL(opts).download([url])
         )
 
     except Exception as exc:
 
+        # Remove temporary files
         shutil.rmtree(
             workdir,
             ignore_errors=True
@@ -268,16 +408,26 @@ async def download(
         )
 
         raise HTTPException(
-            400,
-            "Download failed: " + message[-700:]
+            status_code=400,
+            detail=(
+                "Download failed: "
+                + message[-1000:]
+            )
         )
 
+
+    # ========================================================
+    # FIND GENERATED FILE
+    # ========================================================
+
     files = [
-        p
-        for p in workdir.iterdir()
-        if p.is_file()
-        and not p.name.endswith(".part")
+        file
+        for file in workdir.iterdir()
+        if file.is_file()
+        and not file.name.endswith(".part")
+        and not file.name.endswith(".ytdl")
     ]
+
 
     if not files:
 
@@ -287,35 +437,58 @@ async def download(
         )
 
         raise HTTPException(
-            500,
-            "No file was created."
+            status_code=500,
+            detail="No file was created."
         )
 
+
+    # Newest generated file
     file_path = max(
         files,
-        key=lambda p: p.stat().st_mtime
+        key=lambda file: file.stat().st_mtime
     )
+
+
+    # ========================================================
+    # FILE EXTENSION
+    # ========================================================
 
     ext = file_path.suffix.lower()
 
     if not ext:
-        ext = (
-            ".mp3"
-            if media == "audio"
-            else ".mp4"
-        )
+
+        if media == "audio":
+            ext = ".mp3"
+        else:
+            ext = ".mp4"
+
+
+    # ========================================================
+    # DOWNLOAD FILE NAME
+    # ========================================================
 
     filename = (
         clean_name(file_path.stem)
         + ext
     )
 
+
+    # ========================================================
+    # MIME TYPE
+    # ========================================================
+
     if media == "audio":
+
         media_type = "audio/mpeg"
-    elif ext == ".webm":
-        media_type = "video/webm"
+
     else:
+
         media_type = "video/mp4"
+
+
+    # ========================================================
+    # CLEANUP AFTER RESPONSE
+    # ========================================================
 
     bg.add_task(
         shutil.rmtree,
@@ -323,8 +496,13 @@ async def download(
         True
     )
 
+
+    # ========================================================
+    # RETURN FILE
+    # ========================================================
+
     return FileResponse(
-        str(file_path),
+        path=str(file_path),
         filename=filename,
         media_type=media_type,
-)
+    )
